@@ -5,10 +5,11 @@
 //! `MisskeyClient`, and renders notes with ratatui. All Misskey logic lives in
 //! notecli; this binary only owns terminal state and rendering.
 
+use std::io::{self, Write};
 use std::path::PathBuf;
 use std::time::Duration;
 
-use anyhow::{Context, Result};
+use anyhow::{bail, Context, Result};
 use notecli::api::MisskeyClient;
 use notecli::db::Database;
 use notecli::models::{Account, NormalizedNote, TimelineOptions, TimelineType};
@@ -27,26 +28,133 @@ const TIMELINES: &[(&str, &str)] = &[
     ("global", "Global"),
 ];
 
+/// MiAuth permission scopes requested at login (mirrors notecli's `login`).
+const LOGIN_PERMISSIONS: &[&str] = &[
+    "read:account",
+    "write:account",
+    "read:drive",
+    "write:drive",
+    "read:favorites",
+    "write:favorites",
+    "read:following",
+    "write:following",
+    "read:mutes",
+    "write:mutes",
+    "read:notes",
+    "write:notes",
+    "read:notifications",
+    "write:notifications",
+    "read:reactions",
+    "write:reactions",
+    "write:votes",
+];
+
 #[tokio::main]
 async fn main() -> Result<()> {
+    // notecli stores tokens in the OS keychain and clears the DB copy, so we
+    // must initialize the same credential store before reading or writing
+    // credentials — otherwise keychain lookups fail and we fall back to an
+    // empty DB token.
+    notecli::keychain::init_store().context("failed to initialize credential store")?;
+
     let db_path = data_dir().join("notecli").join("notecli.db");
+    if let Some(parent) = db_path.parent() {
+        std::fs::create_dir_all(parent).ok(); // first-run: DB dir may not exist yet
+    }
     let db = Database::open(&db_path)
         .with_context(|| format!("failed to open account DB at {}", db_path.display()))?;
-
-    let account = db
-        .load_accounts()?
-        .into_iter()
-        .next()
-        .context("no accounts found — run `notecli login <HOST>` first")?;
-    let (host, token) = notecli::get_credentials(&db, &account.id)?;
     let client = MisskeyClient::new()?;
 
+    // Subcommands run before the TUI (they print to stdout / read stdin).
+    let mut args = std::env::args().skip(1);
+    match args.next().as_deref() {
+        Some("login") => {
+            let host = args
+                .next()
+                .context("usage: notetui login <HOST>  (e.g. misskey.io)")?;
+            login(&db, &client, &host).await?;
+            return Ok(());
+        }
+        Some("-h" | "--help") => {
+            print_usage();
+            return Ok(());
+        }
+        Some(other) => bail!("unknown command: {other} (try `notetui login <HOST>`)"),
+        None => {}
+    }
+
+    // No subcommand → launch the TUI. Prompt for login on first run.
+    let account = match db.load_accounts()?.into_iter().next() {
+        Some(account) => account,
+        None => {
+            println!("アカウントがありません。ログインするホストを入力してください (例: misskey.io):");
+            print!("> ");
+            io::stdout().flush().ok();
+            let mut host = String::new();
+            io::stdin().read_line(&mut host)?;
+            let host = host.trim();
+            if host.is_empty() {
+                bail!("ホストが入力されませんでした");
+            }
+            login(&db, &client, host).await?
+        }
+    };
+
+    let (host, token) = notecli::get_credentials(&db, &account.id)?;
     let mut app = App::new(account, client, host, token);
     let mut terminal = ratatui::init();
     app.refresh().await;
     let result = app.run(&mut terminal).await;
     ratatui::restore();
     result
+}
+
+fn print_usage() {
+    println!("notetui — terminal Misskey client\n");
+    println!("USAGE:");
+    println!("  notetui              # launch the TUI (prompts for login if needed)");
+    println!("  notetui login <HOST> # authenticate an account (e.g. misskey.io)");
+}
+
+/// Embedded MiAuth login flow: prints the auth URL, waits for the user to
+/// approve it in a browser, then persists the account. Reuses notecli's
+/// library primitives so the account is shared with notecli/notedeck.
+async fn login(db: &Database, client: &MisskeyClient, host: &str) -> Result<Account> {
+    let session_id = uuid::Uuid::new_v4().to_string();
+    let url = format!(
+        "https://{host}/miauth/{session_id}?name=notetui&permission={}",
+        LOGIN_PERMISSIONS.join(",")
+    );
+    println!("以下のURLをブラウザで開いて認証してください:\n");
+    println!("  {url}\n");
+    print!("認証が完了したらEnterを押してください... ");
+    io::stdout().flush().ok();
+    let mut buf = String::new();
+    io::stdin().read_line(&mut buf)?;
+
+    let auth = client.complete_auth(host, &session_id).await?;
+    let id = uuid::Uuid::new_v4().to_string();
+    let account = Account {
+        id: id.clone(),
+        host: host.to_string(),
+        token: auth.token.clone(),
+        user_id: auth.user.id.clone(),
+        username: auth.user.username.clone(),
+        display_name: auth.user.name.clone(),
+        avatar_url: auth.user.avatar_url.clone(),
+        software: "misskey".to_string(),
+    };
+    db.upsert_account(&account)?;
+
+    // Mirror notecli: store in keychain, verify, then clear the DB copy.
+    if notecli::keychain::store_token(&id, &auth.token).is_ok()
+        && notecli::keychain::get_token(&id).ok().flatten().is_some()
+    {
+        let _ = db.clear_token(&id);
+    }
+
+    println!("ログインしました: @{}@{}", account.username, host);
+    Ok(account)
 }
 
 /// Same data dir notecli uses (see `dirs_data_dir` in notecli's commands/mod.rs).
@@ -208,6 +316,21 @@ impl App {
     }
 
     fn draw_timeline(&mut self, f: &mut Frame, area: ratatui::layout::Rect) {
+        let block = Block::default()
+            .borders(Borders::ALL)
+            .title(format!(" {} ", TIMELINES[self.tl_idx].1));
+
+        // Empty state: show a hint instead of a bare box (loading / no notes).
+        if self.notes.is_empty() {
+            let msg = Paragraph::new(Line::from(Span::styled(
+                format!("  {}", self.status),
+                Style::default().fg(Color::DarkGray),
+            )))
+            .block(block);
+            f.render_widget(msg, area);
+            return;
+        }
+
         let width = area.width.saturating_sub(2) as usize; // borders
         let items: Vec<ListItem> = self
             .notes
@@ -216,11 +339,7 @@ impl App {
             .collect();
 
         let list = List::new(items)
-            .block(
-                Block::default()
-                    .borders(Borders::ALL)
-                    .title(format!(" {} ", TIMELINES[self.tl_idx].1)),
-            )
+            .block(block)
             .highlight_style(Style::default().bg(Color::Rgb(40, 40, 60)))
             .highlight_symbol("▌");
 

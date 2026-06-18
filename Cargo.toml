@@ -8,10 +8,13 @@ license = "MIT"
 
 [dependencies]
 # Core Misskey client/library. Same crate NoteDeck consumes — TUI is just
-# another frontend over it, kept in its own repo per notecli's architecture.
-notecli = { path = "../notecli" }
+# another frontend over it. Pinned to a git rev (like notedeck) for
+# reproducible builds; bump the rev to pick up notecli changes.
+notecli = { git = "https://github.com/hitalin/notecli", rev = "6f7d7a79d273392320a5f524df7e768347510eaa" }
 ratatui = "0.29"
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "time"] }
 anyhow = "1"
 # Resolve the same data dir notecli/notedeck use, so we share the account DB.
 dirs = "6"
+# MiAuth session IDs for the embedded login flow.
+uuid = { version = "1", features = ["v4"] }
